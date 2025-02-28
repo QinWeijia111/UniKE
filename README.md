@@ -5,8 +5,6 @@ Towards Unified Multimodal Editing with Enhanced Knowledge Collaboration
 <div align="center">
 Kaihang Pan<sup>1</sup>*, Zhaoyu Fan<sup>1</sup>*, Juncheng Li<sup>1&dagger;</sup>, Qifan Yu<sup>1</sup>, Hao Fei<sup>2</sup>, Siliang Tang<sup>1</sup>, Richang Hong<sup>3</sup>, Hanwang Zhang<sup>4</sup>, Qianru Sun<sup>5</sup>
 
-<sup>1</sup>Zhejiang University, <sup>2</sup>DAMO Academy, Alibaba Group, <sup>3</sup>Worcester Polytechnic Institute
-
 <sup>1</sup>Zhejiang University, <sup>2</sup>National University of Singapore, <sup>3</sup>Hefei University of Technology, <sup>4</sup>Nanyang Technological University, <sup>5</sup>Singapore Management University
 
 <sup>*</sup>Equal Contribution, <sup>&dagger;</sup>Corresponding Author
