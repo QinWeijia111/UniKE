@@ -15,6 +15,9 @@ Kaihang Pan<sup>1</sup>*, Zhaoyu Fan<sup>1</sup>*, Juncheng Li<sup>1&dagger;</su
 
 This repo contains the PyTorch implementation of [Towards Unified Multimodal Editing with Enhanced Knowledge Collaboration](https://openreview.net/forum?id=kf80ZS3fVy), which is accepted by **NeurIPS2024 (Spotlight)**.
 
+### Note
+
+Given our previous busy schedule, we only uploaded a basic version of the code and forgot to check its accuracy. Our code is based on EasyEdit and Tpatcher. During the process of modifying the code files with Tpatcher, we only altered the internal implementation and did not perform  renaming of methods, functions, or classes for UniKE (still with the name of Tpatcher). We apologize that this non-standard naming has caused minsunderstanding. Additionally, the current code is a version used for later ablation experiments and may differ from the main method in some details. We will promptly reorganize the code in a standardized manner to avoid any unnecessary misunderstandings.
 
 ## Acknowledgment
 
