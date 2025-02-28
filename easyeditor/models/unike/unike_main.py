@@ -4,6 +4,7 @@ from copy import deepcopy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.optim import Adam, SGD
 from torch.optim.lr_scheduler import CosineAnnealingLR, StepLR, ReduceLROnPlateau
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from dataclasses import dataclass
@@ -11,7 +12,6 @@ from easyeditor.trainer.blip2_models import MiniGPTOutput
 
 from .unike_hparams import UniKEHyperParams
 from .src.models.seq2seq_modules import Editor
-from ...evaluate import prepare_multimodal_edit, compute_multimodal_edit_results_demo
 from ...trainer.utils import dict_to, cu_del
 import gc
 
@@ -20,7 +20,7 @@ CONTEXT_TEMPLATES_CACHE = None
 COV_CACHE = {}
 
 
-def apply_tp_to_model_mm(
+def apply_unike_to_model_mm(
     model: AutoModelForCausalLM,
     tok: AutoTokenizer,
     requests: List[Dict],
@@ -42,7 +42,7 @@ def apply_tp_to_model_mm(
     if copy:
         model = deepcopy(model)
 
-    model, weights_copy = execute_tp(model, tok, requests, hparams, **kwargs)
+    model, weights_copy = execute_unike(model, tok, requests, hparams, **kwargs)
 
 
     if not keep_original_weight:
@@ -76,6 +76,7 @@ def construct_mm_samples(
     """
     ret = {}
     # First, unpack rewrite evaluation record.
+    from ...evaluate import prepare_multimodal_edit, compute_multimodal_edit_results_demo
     
     target = record["target"]
     rewrite_prompts = record["prompt"]
@@ -120,13 +121,14 @@ def print_trainable_params(model):
             print("Trainable params: ", name)
 
 
-def execute_tp(
+def execute_unike(
     model: AutoModelForCausalLM,
     tok: AutoTokenizer,
     requests: List[Dict],
     hparams: UniKEHyperParams,
     **kwargs
     ) -> Tuple[AutoModelForCausalLM, Dict[str, Any]]:
+    from ...evaluate import prepare_multimodal_edit, compute_multimodal_edit_results_demo
 
     # get editor from kwargs
     reload_weights = kwargs.get("reload_weights", False)
@@ -150,36 +152,44 @@ def execute_tp(
     
     error_count = hparams.hyperparams_nn_count
     editor.set_add_neuron_num(error_count)
-    hidden_size = model.llama_model.config.hidden_size
+    # hidden_size = model.llama_model.config.hidden_size
             
-    if reload_weights:
-        # if need to set the editors after restore
-        editor.set_editors(init_weights=init_weights, error_count=error_count, select_index=select_index)
-
-    max_epochs_tp = hparams.max_epochs_tp
+    max_epochs = hparams.max_epochs
     # configure optimizer
     opt_class = getattr(torch.optim, hparams.opt_class)
-    global_iter = kwargs.get("global_iter", -1)
-    path = f"{hparams.results_dir}/models/{hparams.alg}/{hparams.model_name}/{task}/l_ike_{global_iter}.pth" # save l_ike layer path
-    dir_name = os.path.dirname(path)
-    if not os.path.exists(dir_name):
-        os.makedirs(dir_name)
 
-    samples_count = hparams.l_ike_samples
-
-    editor.train_params("tp")
+    # Note:
+    # All of core implementation code is heavily modified based on the internal implementation code of tpatcher.
+    # 1. easyeditor/models/unike/src/models/patch.py: The class AdapterLayer is for External Knowledge Resorting on latent space with alpha as the cosine similarity
+    # 2. easyeditor/models/unike/src/models/patch.py: ModifyLinearInput.get_modified_weight_bias we add β · ζ′
     
+    ### External Knowledge Resorting
+    sample_id = kwargs.get("sample_id", -1)
+    cur_retrieved_knowledge_tensor_path = f"/cache/retrieved_states/mmedit/{task}/ike_{sample_id}.pth" # the pth file stores the pre-retrieved in-context latents
+    editor.set_kv(cur_retrieved_knowledge_tensor_path) # we set it as the in-context knowledge for the current model
+
+    # if editor.latent_ike is None:
+    latent_ike_path = f"/cache/tensor/l-ike.pth"
+    editor.set_latent_ike(latent_ike_path)
+    editor.set_editors(init_weights=init_weights, error_count=error_count, select_index=select_index)
+
+    
+    ### Intrinsic Knowledge Editing: we follow the implementation of t-patcher.
+    editor.train_params("unike")
     inner_res["res"], inner_res["logits"] = compute_multimodal_edit_results_demo(model, hparams.model_name, hparams, tok, requests[0], model.device)
-    tp_params = [p for n,p in model.named_parameters() if p.requires_grad]
-    opt = opt_class(tp_params, lr=hparams.edit_lr)
+    params = [p for n,p in model.named_parameters() if p.requires_grad]
+    param_names = [n for n,p in model.named_parameters() if p.requires_grad]
+    opt = opt_class(params, lr=hparams.edit_lr)
     batch = batch_samples["rewrite_sample"]
-    for e in range(max_epochs_tp):
+    for e in range(max_epochs):
+        # model.llama_model.model.layers[31].mlp.up_proj.extra_output.weight.requires_grad
         # forward
         outputs = _logits(model(batch))
         loss = masked_log_probs(hparams, outputs, batch["labels"], shift=True)["nll"]
         loss.backward()
+        print(f"Epoch {e}, loss: {loss.item()}")
         if hparams.do_clip_norm:
-            torch.nn.utils.clip_grad_norm_(tp_params, max_norm=hparams.max_norm)
+            torch.nn.utils.clip_grad_norm_(params, max_norm=hparams.max_norm)
         opt.step()
         opt.zero_grad()
     

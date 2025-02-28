@@ -28,7 +28,7 @@ class UniKEHyperParams(HyperParams):
     tp_layers: Dict[str, str]
     l_ike_layers: List[str]
     
-    l_ike_alpha: float
+    beta: float
     archive: Any
 
     # Method
@@ -120,7 +120,7 @@ class UniKEHyperParams(HyperParams):
     add_l_ike_layer: Optional[bool] = False # in-context vector layer
     do_clip_norm: Optional[bool] = False
     
-    max_epochs_tp: Optional[int] = 10
+    max_epochs: Optional[int] = 10
     ike: Optional[bool] = False
     sentence_model_name: Optional[str] = None
     k: Optional[int] = 1
@@ -144,6 +144,6 @@ class UniKEHyperParams(HyperParams):
             config = yaml.safe_load(stream)
             config = super().construct_float_from_scientific_notation(config)
 
-        assert (config and config['alg_name'] == 'TPATCHER') or print(f'UniKEHyperParams can not load from {hparams_name_or_path}, '
+        assert (config and config['alg_name'] == 'UNIKE') or print(f'UniKEHyperParams can not load from {hparams_name_or_path}, '
                                                 f'alg_name is {config["alg_name"]} ')
         return cls(**config)

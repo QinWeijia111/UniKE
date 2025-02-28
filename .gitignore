@@ -1,0 +1,10 @@
+*.pyc
+.DS_Store
+hugging_cache
+images/
+data/
+logs/
+**/__pycache__/
+.vscode/
+.idea/
+results/

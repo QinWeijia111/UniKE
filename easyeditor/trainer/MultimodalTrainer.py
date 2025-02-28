@@ -168,7 +168,7 @@ class MultimodalTrainer(BaseTrainer):
             l_total_edit = self.config.cedit * l_edit + self.config.cloc * (l_loc+l_image_loc) + self.config.iedit * l_image_edit
         
 
-        if training and self.config.alg != 'ft' and self.config.alg != 'TPATCHER':
+        if training and self.config.alg != 'ft' and self.config.alg != 'TPATCHER' and self.config.alg != 'UNIKE':
             safe_backward(l_total_edit, self.model.outer_parameters(), self.config.accumulate_bs, allow_unused=True)
 
         # Text locality

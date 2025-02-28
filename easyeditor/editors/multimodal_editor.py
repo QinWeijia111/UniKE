@@ -145,11 +145,12 @@ class MultimodalEditor:
         #     2: [_ for _ in range(32, 48)]
         # }
         # self.model.parallelize(device_map=device_map)
+        self.model.bfloat16()
         self.model.to(f'cuda:{hparams.device}')
         self.hparams = hparams
         self.vis_root = hparams.coco_image
         self.rephrase_root = hparams.rephrase_image
-        if self.alg_name == 'TPATCHER':
+        if self.alg_name == 'UNIKE':
             from ..models.unike.src import Editor
             self.editor = Editor(
                             model=model,
@@ -161,7 +162,7 @@ class MultimodalEditor:
                             margin_val2=hparams.margin_val2, device=model.device,
                             hparams=hparams,
                         )
-            self.editor.set_latent_ike('./results/l-ike')
+
             
             
 
@@ -274,7 +275,7 @@ class MultimodalEditor:
 
                 all_metrics.append(metrics)
             else:
-                if self.alg_name == 'TPATCHER':
+                if self.alg_name == 'UNIKE':
                     self.editor.restore_edit()
                 edited_model, weights_copy = self.apply_algo(
                     self.model,
@@ -512,7 +513,7 @@ class MultimodalEditor:
 
     
     def backup_layers(self):
-        if self.hparams.alg_name == 'TPATCHER':
+        if self.hparams.alg_name == 'UNIKE':
             pass
         elif self.hparams.alg_name == 'FT_MULTI':
             weights = {
@@ -566,6 +567,8 @@ class MultimodalEditor:
             for i, request in tqdm(enumerate(ds), desc='Results before editing', total=len(ds)):
                 pre, pre_logits = compute_multimodal_edit_results_demo(self.model, self.model_name, self.hparams, self.tok, request, self.hparams.device)
                 pres.append(pre)
+            if not os.path.exists('./results/cache/'):
+                os.mkdir('./results/cache/')
             save_object(pres, cached_path)
             
         self.model.zero_grad() # clear the gradient to ensure
@@ -655,11 +658,11 @@ class MultimodalEditor:
                     return_orig_weights=True,
                     keep_original_weight=keep_original_weight,
                     train_ds=kwargs['train_ds'] if self.alg_name == 'IKE' else None,
-                    editor=self.editor if self.alg_name == 'TPATCHER' else None,
+                    editor=self.editor if self.alg_name == 'UNIKE' else None,
                     collate_fn=ds.collate_fn,
                     pre=pre,
                     inner_res=inner_res,
-                    global_iter=i,
+                    sample_id=i,
                     task=task,
                     reload_weights=reload_weights
                 )
@@ -667,7 +670,7 @@ class MultimodalEditor:
                 LOG.info(f"Execution {i} editing took {exec_time}")
                 # self.model = edited_model
                 start = time()
-                if self.alg_name == 'TPATCHER' and self.hparams.ike == True:
+                if self.alg_name == 'UNIKE' and self.hparams.ike == True:
                     ike_method = ALG_MULTIMODAL_DICT['IKE']
                     icl_examples = ike_method(
                         self.model,
@@ -707,7 +710,7 @@ class MultimodalEditor:
                     reload_weights = False
                 torch.cuda.empty_cache()
                         
-                if self.alg_name == 'TPATCHER':
+                if self.alg_name == 'UNIKE':
                     if reload_weights:
                         self.editor.clear_editors()
                         self.editor.clean_cache()
@@ -743,7 +746,7 @@ class MultimodalEditor:
                             torch.cuda.empty_cache()
                 metrics["pre"] = pre
                 # calculate the locality accuracy
-                if self.alg_name == 'TPATCHER':
+                if self.alg_name == 'UNIKE':
                     if 'locality_output' in metrics['inner_res'].keys():
                         assert len(metrics['inner_res']['locality_output']) == \
                                 len(metrics['pre']['locality_output'])
@@ -759,7 +762,7 @@ class MultimodalEditor:
                             np.mean(np.equal(metrics['inner_res']['multimodal_locality_output'],
                                                 metrics['pre']['multimodal_locality_output']))
                         metrics['inner_res'].pop('multimodal_locality_output')
-                if self.alg_name == 'TPATCHER' and self.hparams.ike == True:
+                if self.alg_name == 'UNIKE' and self.hparams.ike == True:
                     metrics['post']['locality_output'] = metrics['post']['locality_output_ids']
                     metrics['post']['multimodal_locality_output'] = metrics['post']['multimodal_locality_output_ids']
                     metrics['post'].pop('locality_output_ids')

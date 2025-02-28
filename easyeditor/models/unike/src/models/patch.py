@@ -5,6 +5,7 @@ import copy
 import random
 import numpy as np
 import pdb
+import os
 import torch.nn.functional as F
 from tqdm import tqdm
 from torch.nn import init
@@ -102,14 +103,22 @@ class Encoder(nn.Module):
         return x
 
 class AdapterLayer(nn.Module):
-    def __init__(self, hidden_dim, kv, num_layers=1, alpha=0.9, m=64):
+    def __init__(self, hidden_dim, kv, num_layers=1, alpha=0.9, m=64, encoder_path=''):
         super(AdapterLayer, self).__init__()
         self.num_layers = num_layers
         self.hidden_dim = hidden_dim
         # self.alpha = torch.mean(torch.tensor(alpha))
         self.alpha = torch.tensor(alpha)
-        self.kv = kv # [m, d]
-        self.encoder = Encoder(hidden_dim)
+        if kv is not None:
+            self.kv = kv # [m, d]
+        else:
+            self.kv = nn.Parameter(torch.randn(m, hidden_dim))
+        self.kv.requires_grad_(False)
+        self.semantic_encoder = Encoder(hidden_dim)
+        if os.path.exists(encoder_path):
+            self.semantic_encoder.load_state_dict(torch.load(encoder_path))
+        for n,p in self.semantic_encoder.named_parameters():
+            p.requires_grad = False
         # learnable params
         self.unfreeze_self()
     
@@ -117,11 +126,12 @@ class AdapterLayer(nn.Module):
         attn_weights = torch.matmul(x, self.kv.T) 
         attn_weights = F.softmax(attn_weights, dim=-1) 
         attn_output = torch.matmul(attn_weights, self.kv) 
-        l1 = self.encoder(attn_output)
+        l1 = self.semantic_encoder(attn_output)
         l2 = x
         # unsqueeze the first two dimensions
         l1 = l1.squeeze(0).squeeze(0)
         l2 = l2.squeeze(0).squeeze(0)
+        
         # calc the cosine similarity
         self.alpha = F.cosine_similarity(l1, l2, dim=-1)
         x = F.normalize(x, p=2, dim=-1)
@@ -130,15 +140,10 @@ class AdapterLayer(nn.Module):
         return res
   
     def unfreeze_self(self):
-        # self.l_ikes.requires_grad_(True)
-        self.kv.requires_grad_(True)
         self.ln1.requires_grad_(True)
         self.ln2.requires_grad_(True)
     
     def freeze_self(self):
-        # self.l_ikes = self.l_ikes.detach()
-        # self.kv = self.kv.detach()
-        self.kv.requires_grad_(False)
         self.ln1.requires_grad_(False)
         self.ln2.requires_grad_(False)
 
@@ -196,14 +201,12 @@ class ModifyLinearOutput(nn.Module):  # nn.Linear(input_size, output_size) -> nn
             self.vec_avg = vec_avg
         else:
             # initialize the l_ike avg to all 1 tensor
-            self.vec_avg = torch.ones([self.hidden_size])
-        self.encoder_linear = nn.Linear(self.hidden_size, self.hidden_size).to(self.device)
-        self.l_ike_alpha = torch.tensor(0.1)
+            self.vec_avg = nn.Parameter(torch.ones([self.hidden_size]).cuda())
+        # self.vec_avg = self.vec_avg.bfloat16()
+        # self.vec_avg = self.vec_avg.to
+        self.encoder_linear = nn.Linear(self.vec_avg.shape[0], self.hidden_size).to(self.device)
+        self.beta = torch.tensor(0.1)
         self.hparams = hparams
-        if self.hparams.tp_extra_tensor_type == 'random':
-            # create the random tensor with the same size as vec_avg
-            self.vec_avg_rand = torch.randn_like(self.vec_avg)
-            
 
     def freeze_self(self):
         for p in self.extra_output.parameters():
@@ -218,10 +221,10 @@ class ModifyLinearOutput(nn.Module):  # nn.Linear(input_size, output_size) -> nn
             p.requires_grad_(True)
 
     def train_mode(self, mode):
-        if mode == "tp":
-            self.freeze_self()
-        else:
+        if mode == "unike":
             self.unfreeze_self()
+        else:
+            self.freeze_self()
             
     def _reset_parameters(self, init_weight):
         scale = torch.norm(init_weight, dim=-1).unsqueeze(-1)
@@ -288,14 +291,7 @@ class ModifyLinearOutput(nn.Module):  # nn.Linear(input_size, output_size) -> nn
     def get_modified_weight_bias(self):
         wd = self.linear.weight.clone().detach()
         we = self.extra_output.weight
-        if self.hparams.tp_extra_tensor_type == 'random':
-            we = we + self.vec_avg_rand
-        elif self.hparams.tp_extra_tensor_type == 'without':
-            we = we
-        elif self.hparams.tp_extra_tensor_type == 'default':
-            we = we + self.l_ike_alpha * self.encoder_linear(self.vec_avg)
-        else:
-            raise ValueError(f"tp_extra_tensor_type {self.hparams.tp_extra_tensor_type} is not supported")
+        we = we + self.beta * self.encoder_linear(self.vec_avg)
         
         if self.linear.bias is not None:
             bd = self.linear.bias.clone().detach()
@@ -342,17 +338,18 @@ class ModifyLinearInput(nn.Module):  # nn.Linear(input_size, output_size) -> nn.
         self._reset_parameters()
         if freeze_a:
             self.a.requires_grad = False
+
         if vec_avg is not None:
             self.vec_avg = vec_avg
         else:
             # initialize the l_ike avg to all 1 tensor
-            self.vec_avg = torch.ones([self.hidden_size])
-        self.encoder_linear = nn.Linear(self.hidden_size, self.hidden_size).to(self.device)
-        self.l_ike_alpha = torch.tensor(0.1)
+            self.vec_avg = nn.Parameter(torch.ones([self.hidden_size]).cuda())
+            
+
+        # self.encoder_linear = nn.Linear(self.hidden_size, self.hidden_size).to(self.device)
+        self.encoder_linear = nn.Linear(self.vec_avg.shape[0], self.hidden_size).to(self.device)
+        self.beta = torch.tensor(0.1)
         self.hparams = hparams
-        if self.hparams.tp_extra_tensor_type == 'random':
-            # create the random tensor with the same size as vec_avg
-            self.vec_avg_rand = torch.randn_like(self.vec_avg)
             
             
     def freeze_self(self):
@@ -368,12 +365,14 @@ class ModifyLinearInput(nn.Module):  # nn.Linear(input_size, output_size) -> nn.
         self.encoder_linear.requires_grad_(True)
         
     def train_mode(self, mode):
-        if mode == "l_ike":
+        if mode == "unike":
+            # self.unfreeze_self()
+            self.requires_grad_(True)
+        else:
             self.extra_input = self.extra_input.detach()
             self.a = self.a.detach()
             # self.freeze_self()
-        elif mode == "tp":
-            self.unfreeze_self()
+
     
     def _reset_parameters(self):
         if self.amplify:
@@ -386,21 +385,12 @@ class ModifyLinearInput(nn.Module):  # nn.Linear(input_size, output_size) -> nn.
         else:
             b = torch.tensor([0] * wd.size(0)).to(wd.device)
         we = self.extra_input
-        if self.hparams.tp_extra_tensor_type == 'random':
-            we = we + self.vec_avg_rand.unsqueeze(-1)
-        elif self.hparams.tp_extra_tensor_type == 'without':
-            we = we
-        elif self.hparams.tp_extra_tensor_type == 'default':
-            we = we + self.l_ike_alpha * self.encoder_linear(self.vec_avg).unsqueeze(-1)
-        else:
-            raise ValueError(f"tp_extra_tensor_type {self.hparams.tp_extra_tensor_type} is not supported")
-       
         
+        we = we + self.beta * self.encoder_linear(self.vec_avg).unsqueeze(-1)
+                
         if self.amplify:
             we = self.extra_input * self.a
-        # if 0 <= self.loc < self.intermediate_size:
-            # w = torch.cat((wd[..., :self.loc], we, wd[..., self.loc+1:]), dim=1)
-        # else:
+
         w = torch.cat((wd, we), dim=1)
         return w, b
 
@@ -439,7 +429,7 @@ class PassThroughLayer(nn.Module):
 
 class ModifyMLPLayer(nn.Module):
     # l_ike and mlp
-    def __init__(self, mlp: Union[LlamaMLP, ModifyLinearOutput, nn.LayerNorm], device, kv, hparams=None, num_layers=1, m=64, alpha=0.9, deepcopy=True, *args, **kwargs) -> None:
+    def __init__(self, mlp: Union[LlamaMLP, ModifyLinearOutput, nn.LayerNorm], device, kv, hparams=None, num_layers=1, m=64, alpha=0.9, deepcopy=True, encoder_path='', *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.device = device
         if deepcopy:
@@ -448,19 +438,18 @@ class ModifyMLPLayer(nn.Module):
             self.mlp = mlp
         self.hparams = hparams
         self.hidden_dim = 4096
-        self.adapt = AdapterLayer(self.hidden_dim, kv, num_layers, alpha, m)
+        self.adapt = AdapterLayer(self.hidden_dim, kv, num_layers, alpha, m, encoder_path=encoder_path)
         
     def forward(self, x):
         x = self.mlp(x)
         x = self.adapt(x)
         return x
     
-    
     def train_mode(self, mode):
-        if mode == "tp":
-            self.l_ike.freeze_self()
+        if mode == "unike":
+            self.adapt.freeze_self()
         else:
-            self.l_ike.unfreeze_self()
+            self.adapt.unfreeze_self()
 
 class ModuleDetector(nn.Module):
 

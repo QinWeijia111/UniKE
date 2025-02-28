@@ -81,11 +81,21 @@ class Editor(nn.Module):
 
         self.hparams = hparams
         
-        self.kv = torch.load(hparams.kv_path)
-        
         if not self.hparams.add_l_ike_layer:
             self.l_ike_layers = []
-            
+        
+        self.latent_ike = None
+        
+    
+    def set_kv(self, retrieves_kv_path: str = None):
+        if os.path.exists(retrieves_kv_path):
+            self.kv = torch.load(retrieves_kv_path)
+        else:
+            print('Warning: kv path does not exist, we will randomly initialize the kv')
+            # kv size: [m, hidden_size]
+            # use nn.parameter to init
+            self.kv = nn.Parameter(torch.randn(80, self.hidden_size))
+    
     def set_add_neuron_num(self, num):
         self.add_neuron_num = self.max_add_neuron_num if num is None else num
 
@@ -118,22 +128,13 @@ class Editor(nn.Module):
         self.editors = []
 
     def set_latent_ike(self, path: str):
-        # read in the l_ike files
-        # list all the files in the directory
-        files = os.listdir(path)
-        # iterate
-        vecs = []
-        for file in files:
-            # read the file, load into cpu
-            l_ike = torch.load(os.path.join(path, file))
-            # get the l_ike info
-            for k, v in l_ike.items():
-                vecs.append(v)
-            
-        # calculate the average, first transform into torch
-        vecs = torch.stack(vecs)
-        vec = torch.mean(vecs, dim=(0, 1))
-        self.latent_ike = vec
+        if os.path.exists(path):
+            self.latent_ike = torch.load(path)
+        else:
+            print('Warning: the latent_ike path does not exist, we will randomly initialize the latent_ike to avoid running error')
+            self.latent_ike = nn.Parameter(torch.ones([self.hidden_size]).cuda())
+            # self.latent_ike = None
+        
     
     def get_latent_ike(self):
         return self.latent_ike
@@ -184,7 +185,7 @@ class Editor(nn.Module):
         for k, v in self.layer_backup.items():
             self.model_named_modules[k[0]]._modules[k[1]] = v
     
-    def train_params(self, mode: str):
+    def train_params(self, mode: str = 'unike'):
         for layer in self.inserted_layers:
             layer.train_mode(mode.lower())
     
@@ -325,6 +326,7 @@ class Editor(nn.Module):
                 e_tmp['original_module'] = self.model_named_modules[n[0]].__getattr__(n[-1])
                 self.editors.append(e_tmp)
         
+        ### Latent incontext Editing
         if self.hparams.add_l_ike_layer:
             for name in self.l_ike_layers:
                 e_tmp = dict()
@@ -338,6 +340,7 @@ class Editor(nn.Module):
                         kv=self.kv,
                         device=self.device, hparams=self.hparams,
                         alpha=alpha,
+                        encoder_path='/cache/models/semantic_encoder.pt'
                     ).to(self.device)
                 else:
                     raise NotImplementedError(f"model_name {self.hparams.model_name} is not supported when getting editors in tp")
@@ -431,364 +434,3 @@ class Editor(nn.Module):
             else:
                 res['memo_loss'] = self.get_memo_loss()
         return res
-
-
-class BartSeq2SeqEditor(LightningModule):
-
-    @staticmethod
-    def add_model_specific_args(parent_parser):
-        parser = ArgumentParser(parents=[parent_parser], add_help=False)
-        return patch_related_args(parser)
-
-    def __init__(self, *args, **kwargs):
-        super().__init__()
-        add_neuron_num = kwargs.get('add_neuron_num')
-        if 'model' in kwargs:
-            model = kwargs.get('model')
-        else:
-            model = BartSeq2Seq.load_from_checkpoint(self.hparams.model_path)
-        self.save_hyperparameters()
-        # if cuda available:
-        if torch.cuda.is_available():
-            self.current_device = torch.device('cuda', self.hparams.gpus[0])
-        else:
-            self.current_device = torch.device('cpu')
-        self.editor = Editor(
-            model=model,
-            max_add_neuron_num=self.hparams.max_add_neuron_num,
-            freeze_model=self.hparams.freeze_model, freeze_k=self.hparams.freeze_k, freeze_a=self.hparams.freeze_a,
-            memory_size=self.hparams.memory_size, memory_loss=self.hparams.memory_loss,
-            amplify_v=self.hparams.amplify_v, activate_loss=self.hparams.activate_loss,
-            act_margin_val=self.hparams.act_margin_val, margin_val1=self.hparams.margin_val1,
-            margin_val2=self.hparams.margin_val2, device=self.current_device
-        )
-        # if this is a continuation of previous experiments, we need extend the size of the edited layer
-        if add_neuron_num is not None:
-            for _ in range(add_neuron_num):
-                self.editor.set_editors()
-                self.editor.step()
-        self.edit_acc = Accuracy()
-        self.val_loader = None
-        self.valid_memory_loss = []
-        self.valid_metric = []
-        self.save_ckpt = 0
-        self.stop_editing = False
-        self.start_example_editing = False
-        self.BIG_CONSTANT = 10000
-        self.has_stepped = False
-
-    def on_train_start(self):
-        self.valid_memory_loss = []
-        self.valid_metric = []
-        self.save_ckpt = 0
-        self.start_example_editing = False
-        self.stop_editing = False
-        self.has_stepped = False
-
-    @staticmethod
-    def early_stop_editing(metrics, mode='min', thd=0.0, patience=1):
-        best_step = 0
-        for step, vm in enumerate(metrics):
-            if mode == 'min':
-                if vm < metrics[best_step] - thd:
-                    best_step = step
-            else:
-                if vm > metrics[best_step] + thd:
-                    best_step = step
-
-        if best_step < len(metrics) - patience:
-            return True
-        else:
-            return False
-
-    @staticmethod
-    def save_editing_ckpt(metrics, mode='min'):
-        # save the model if new val metric is attained
-        return (mode == 'min' and min(metrics) == metrics[-1]) or (mode == 'max' and max(metrics) == metrics[-1])
-
-    def fed_val_loader(self, dl):
-        self.val_loader = dl
-
-    def reset(self, clear_memory):
-        self.editor.reset_model(
-            BartSeq2Seq.load_from_checkpoint(self.hparams.model_path),
-            clear_memory=clear_memory
-        )
-
-    def joint_training(self, batch, batch_idx=None):
-        input_ids = batch["src_input_ids"]
-        res = self.editor(
-            input_ids, batch["src_attention_mask"],
-            batch["trg_input_ids"], batch["trg_attention_mask"]
-        )
-        loss = res['loss']
-        if self.hparams.activate_loss != "non_use":
-            self.log("al", res['act_loss'], on_step=True, on_epoch=False, prog_bar=True, batch_size=input_ids.size(0))
-            loss = loss + self.hparams.alc * res['act_loss']
-        if self.hparams.memory_loss != 'non_use':
-            self.log("ml", res['memo_loss'], on_step=True, on_epoch=False, prog_bar=True, batch_size=input_ids.size(0))
-            loss = loss + self.hparams.mlc * res['memo_loss']
-        return {"loss": loss}
-
-    def training_step(self, batch, batch_idx=None, optimizer_idx=None):
-        return self.joint_training(batch, batch_idx)
-
-    def joint_validation(self, batch, batch_idx=None):
-        stop_editing, save_ckpt = False, False
-        input_ids = batch["src_input_ids"]
-        b_size = input_ids.size(0)
-        res = self.editor(
-            input_ids, batch["src_attention_mask"],
-            batch["trg_input_ids"], batch["trg_attention_mask"]
-        )
-        self.log("val_loss", res['loss'], on_step=False, on_epoch=True, prog_bar=True, batch_size=b_size)
-
-        if self.current_epoch >= self.hparams.start_val_epoch:
-            self.editor.do_not_act_val()
-            model_gen = self.editor.model.model.generate(
-                input_ids=batch["src_input_ids"], attention_mask=batch["src_attention_mask"],
-                min_length=1, num_beams=NUM_BEAMS, num_return_sequences=1, use_cache=True
-            )
-            self.editor.do_act_val()
-            target_len = batch["trg_input_ids"].size(1)
-            edit_acc = model_gen[:, :target_len].equal(batch["trg_input_ids"])
-            if self.hparams.use_val == 1:
-                if edit_acc:
-                    self.valid_memory_loss.append(res['memo_loss'])
-                    stop_editing = float(self.early_stop_editing(
-                        metrics=self.valid_memory_loss, thd=0.001,
-                        patience=self.hparams.early_patience, mode='min'
-                    ))
-                    save_ckpt = float(self.save_editing_ckpt(metrics=self.valid_memory_loss, mode='min') or (stop_editing == 1))
-            else:
-                stop_editing = float(edit_acc)
-                save_ckpt = edit_acc
-
-            if self.hparams.memory_loss != 'non_use' and not self.hparams.memory_loss.startswith('kl'):
-                self.log("v_ml", res['memo_loss'], on_step=False, on_epoch=True, prog_bar=True, batch_size=b_size)
-
-        self.save_ckpt += save_ckpt
-        self.stop_editing = stop_editing
-        if self.stop_editing == 1:
-            self.editor.step()
-            self.has_stepped = True
-        self.log("stop_editing", float(stop_editing), on_step=False, on_epoch=True, prog_bar=True)
-        self.log("save_ckpt", self.save_ckpt, on_step=False, on_epoch=True, prog_bar=True)
-
-    def validation_step(self, batch, batch_idx=None):
-        self.joint_validation(batch, batch_idx)
-
-    def memorize(self, train_memory_data: DataLoader, device, update, val_memory_data: DataLoader = None):
-        self.editor.construct_memory(
-            data=train_memory_data, device=device,
-            memory_size=self.hparams.memory_size, update=update, memory_use='train'
-        )
-        if not update:
-            self.editor.construct_memory(
-                data=val_memory_data, device=device,
-                memory_size=self.hparams.memory_size, update=update, memory_use='val'
-            )
-
-    def get_optimizer(self, params, lr=None, optim=None):
-        if lr is None:
-            lr = self.hparams.lr
-        if optim is None:
-            optim = self.hparams.optim
-        if optim == "adam":
-            return torch.optim.Adam(params=params, lr=lr, weight_decay=self.hparams.weight_decay)
-        if optim == 'rmsprop':
-            return torch.optim.RMSprop(params=params, lr=lr)
-        if optim == 'sgd':
-            return torch.optim.SGD(params=params, lr=lr, weight_decay=self.hparams.weight_decay, momentum=0.9)
-
-    def configure_optimizers(self):
-        # for the joint editing style, we just need one parameter
-        parameters = [p for p in self.editor.parameters() if p.requires_grad]
-        optimizer = self.get_optimizer(parameters)
-
-        lr_scheduler = ReduceLROnPlateau(
-            optimizer=optimizer, mode='min',
-            factor=self.hparams.lr_scheduler_factor,
-            patience=self.hparams.lr_scheduler_patience,
-            threshold=0.05
-        )
-
-        lr_scheduler_config = {
-            "scheduler": lr_scheduler,
-            "interval": "epoch", "frequency": self.hparams.check_val_every_n_epoch,
-            "monitor": "val_loss", "strict": True
-        }
-        optimizer_list = [optimizer]
-        lr_scheduler_config_list = [lr_scheduler_config]
-
-        return optimizer_list, lr_scheduler_config_list
-
-
-class BartSeq2Seq(LightningModule):
-    @staticmethod
-    def add_model_specific_args(parent_parser):
-        parser = ArgumentParser(parents=[parent_parser], add_help=False)
-
-        parser.add_argument(
-            "--train_data_path", type=str,
-            default='./easyeditor/models/tpatcher/data/zsre_data/zsre-train.jsonl'
-        )
-        parser.add_argument(
-            "--dev_data_path", type=str,
-            default='./easyeditor/models/tpatcher/data/zsre_data/zsre-val.jsonl'
-        )
-        # par
-        parser.add_argument("--num_beams", type=int, default=NUM_BEAMS)
-        parser.add_argument("--batch_size", type=int, default=32)
-        parser.add_argument("--lr", type=float, default=3e-5)
-        parser.add_argument("--max_length", type=int, default=32)
-        parser.add_argument("--weight_decay", type=int, default=0.01)
-        parser.add_argument("--total_num_updates", type=int, default=50000)
-        parser.add_argument("--warmup_updates", type=int, default=500)
-        parser.add_argument("--num_workers", type=int, default=0)
-        parser.add_argument("--model_name", type=str, default="facebook/bart-base")
-        parser.add_argument("--eps", type=float, default=0.1)
-        return parser
-
-    def __init__(self, *args, **kwargs):
-        super().__init__()
-        self.save_hyperparameters()
-        model_dir = os.path.join(self.hparams.cache_dir, self.hparams.model_name) \
-            if "cache_dir" in self.hparams else self.hparams.model_name
-        try:
-            self.tokenizer = BartTokenizer.from_pretrained(model_dir)
-            self.model = BartForConditionalGeneration.from_pretrained(model_dir)
-        except:
-            print("The cache can not be used")
-            self.tokenizer = BartTokenizer.from_pretrained(self.hparams.model_name)  # have internet
-            self.model = BartForConditionalGeneration.from_pretrained(self.hparams.model_name)  # have internet
-        self.train_acc = Accuracy()
-        self.valid_acc = Accuracy()
-
-    def train_dataloader(self, shuffle=True):
-        if not hasattr(self, "train_dataset"):
-            self.train_dataset = Seq2SeqData(
-                tokenizer=self.tokenizer,
-                data_path=self.hparams.train_data_path,
-                max_length=self.hparams.max_length,
-            )
-        return DataLoader(
-            self.train_dataset, batch_size=self.hparams.batch_size,
-            collate_fn=self.train_dataset.collate_fn,
-            num_workers=self.hparams.num_workers, shuffle=shuffle,
-        )
-
-    def val_dataloader(self):
-        if not hasattr(self, "val_dataset"):
-            self.val_dataset = Seq2SeqData(
-                tokenizer=self.tokenizer,
-                data_path=self.hparams.dev_data_path,
-                max_length=self.hparams.max_length,
-                validation=True,
-            )
-        return DataLoader(
-            self.val_dataset,
-            batch_size=16,
-            collate_fn=self.val_dataset.collate_fn,
-            num_workers=self.hparams.num_workers,
-        )
-
-    def forward(self, input_ids, attention_mask, decoder_input_ids, decoder_attention_mask):
-        # batch_size x trg_len x vocab_size
-        return self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            decoder_input_ids=decoder_input_ids,
-            decoder_attention_mask=decoder_attention_mask,
-            use_cache=False,
-        ).logits
-
-    def training_step(self, batch, batch_idx=None):
-        input_ids = batch["src_input_ids"]
-        attention_mask = batch["src_attention_mask"]
-        decoder_input_ids = batch["trg_input_ids"][:, :-1]
-        decoder_attention_mask = batch["trg_attention_mask"][:, :-1]
-        logits = self.forward(input_ids, attention_mask, decoder_input_ids, decoder_attention_mask)
-        loss, nll_loss = label_smoothed_nll_loss(
-            logits.log_softmax(-1), batch["trg_input_ids"][:, 1:],
-            epsilon=self.hparams.eps, ignore_index=self.tokenizer.pad_token_id,
-        )
-
-        ntokens = batch["trg_attention_mask"][:, 1:].sum()
-        loss, nll_loss = loss / ntokens, nll_loss / ntokens
-        self.log("nll_loss", nll_loss, on_step=True, on_epoch=False, prog_bar=True)
-        return {"loss": loss}
-
-    def validation_step(self, batch, batch_idx=None):
-        trg = [b["trg"] for b in batch["raw"]]
-        pred = self.tokenizer.batch_decode(
-            self.model.generate(
-                input_ids=batch["src_input_ids"], attention_mask=batch["src_attention_mask"],
-                min_length=0, num_beams=self.hparams.num_beams, num_return_sequences=1, use_cache=True
-            ),
-            skip_special_tokens=True
-        )
-        acc = torch.tensor(
-            [
-                p.lower().strip() in [t_.lower().strip() for t_ in t]
-                for t, p in zip(trg, pred)
-            ]
-        ).long()
-        self.valid_acc(acc, torch.ones_like(acc))
-        self.log("valid_acc", self.valid_acc, on_step=False, on_epoch=True, prog_bar=True, batch_size=len(trg))
-
-    def test_step(self, batch, batch_idx=None):
-        trg = [b["trg"] for b in batch["raw"]]
-        pred = self.tokenizer.batch_decode(
-            self.model.generate(
-                input_ids=batch["src_input_ids"], attention_mask=batch["src_attention_mask"],
-                min_length=0, num_beams=self.hparams.num_beams, num_return_sequences=1, use_cache=True
-            ),
-            skip_special_tokens=True
-        )
-        acc = [
-                p.lower().strip() in [t_.lower().strip() for t_ in t]
-                for t, p in zip(trg, pred)
-        ]
-        acc = torch.tensor(acc).long()
-        self.valid_acc(acc, torch.ones_like(acc))
-        self.log("test_acc", self.valid_acc, on_step=False, on_epoch=True, prog_bar=True)
-
-    def configure_optimizers(self):
-        no_decay = ["bias", "LayerNorm.weight"]
-        optimizer_grouped_parameters = [
-            {
-                "params": [
-                    p
-                    for n, p in self.model.named_parameters()
-                    if not any(nd in n for nd in no_decay)
-                ],
-                "weight_decay": self.hparams.weight_decay,
-            },
-            {
-                "params": [
-                    p
-                    for n, p in self.model.named_parameters()
-                    if any(nd in n for nd in no_decay)
-                ],
-                "weight_decay": 0.0,
-            },
-        ]
-
-        optimizer = torch.optim.AdamW(
-            optimizer_grouped_parameters,
-            lr=self.hparams.lr,
-            weight_decay=self.hparams.weight_decay,
-        )
-
-        scheduler = get_linear_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=self.hparams.warmup_updates,
-            num_training_steps=self.hparams.total_num_updates,
-        )
-
-        return [optimizer], [
-            {"scheduler": scheduler, "interval": "step", "frequency": 1}
-        ]
-
-

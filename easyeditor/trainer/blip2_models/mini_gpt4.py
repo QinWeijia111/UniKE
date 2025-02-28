@@ -7,7 +7,7 @@ import torch.nn as nn
 
 from .blip2 import Blip2Base, disabled_train
 from .modeling_llama import LlamaForCausalLM
-from transformers import LlamaTokenizer
+from transformers import LlamaTokenizer, LlamaConfig
 from transformers.utils import ModelOutput
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from typing import Optional, Tuple
@@ -97,7 +97,10 @@ class MiniGPT4(Blip2Base):
         print('Loading LLAMA')
         self.llama_tokenizer = LlamaTokenizer.from_pretrained(llama_model, use_fast=False)
         self.llama_tokenizer.pad_token = self.llama_tokenizer.eos_token
-
+        self.without_weights = True
+        # if self.without_weights:
+        #     config = LlamaConfig.from_pretrained(llama_model)
+        #     self.llama_model = LlamaForCausalLM(config)
         if self.low_resource:
             self.llama_model = LlamaForCausalLM.from_pretrained(
                 llama_model,
